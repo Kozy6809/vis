@@ -1,0 +1,563 @@
+#Rによる粘度データの解析
+
+#○解析の手順
+library("RODBC")
+ch<-odbcConnect("qc")
+
+#1.まずDBのサニティチェックを実施し、おかしな粘度値は修正しておく
+
+#boxplotを使ったサニティチェック。外れ値を抽出している。チェックしたい列ごとに書き換えて実行する
+san<-tapply(t$ah, t$pcode, FUN=function(x){boxplot(x, plot=F)$out})
+cpy(unlist(san)) #unlistすると外れ値を含むものだけが残る
+
+
+#変更点
+#日付を数値型から日付型に変更する
+#予測を現在時点でなく、データの最新時点で実施する
+
+#4.品質管理dbの"粘度データ"テーブルからデータ取得
+library("RODBC")
+ch<-odbcConnect("qc")
+format(Sys.Date()-3652, "#%Y/%m/%d#")->day #10年前の日付
+t<-sqlQuery(ch, paste("select input_date, seizou_code, lot_no, day_10, day_100, week_10, week_100, heat_10, heat_100 from 粘度データ where input_date > ", day, "and judgement = 0 order by seizou_code, input_date;"))
+
+#cbind(as.Date(t[,1]), t[,-1])->t
+names(t)<-c("day", "pcode", "lot", "dl", "dh", "wl", "wh", "al", "ah")
+
+#5.現場粘度データ取得
+hiravisiv<-sqlQuery(ch, "select * from hiravisiv")
+names(hiravisiv)[6]<-"day"
+
+#tと結合。
+t<-merge(hiravisiv, t, all.y=T)
+
+#現場粘度に対応する品管粘度が無い場合、当該ロットが再練になったケースが考えられる(tを取得するクエリーでは正常なロットのみを抽出しているから)
+
+#粘度規格は同じ製造コードで2件(HAC, HAU)入っているものがあるので注意が必要
+#粘度規格表をそのままコピペしてから、重複行を除去する
+spec<-unique(spec[,-2:-3]) #series, ccを削除し、重複を除去
+
+#水系1日値と規格値をバインド
+tmp<-merge(t[,c(1:3,9)], spec, by='pcode')
+#1日粘度が下限以下の個数
+nrow(tmp[tmp$dh < tmp$db,])	#1932
+#1日粘度が上限以上の個数
+nrow(tmp[tmp$dh > tmp$dt,])	#1816
+#合わせた比率 (1932+1816)/17244=21.7%
+#粘度規格をはみ出したことのある色 435/744=58.5%
+
+#安定度指数の計算
+#これでは10年分の全粘度データから求めている。データ範囲は回帰の寄与率の最小値から決めるべき
+sd.d0<-tapply(t$d0h, t$pcode, FUN=sd, na.rm=T)
+sd.dh<-tapply(t$dh, t$pcode, FUN=sd, na.rm=T)
+sd.wh<-tapply(t$wh, t$pcode, FUN=sd, na.rm=T)
+sd.v<-cbind(sd.d0, sd.dh, sd.wh)
+
+#回帰の寄与をデータ点の個数を減らしながら調べる。粘度値としてdhを使用するよう決め打ちしていることに注意
+#解析対象列を選択できるようにし、現行規格値をプロットするようにしたバージョン
+#デフォルトで1日粘度の解析。1週間はix=11,specix=5とする
+#オプションrm.outでboxplotの外れ値を除去した解析を指定する
+#戻り値:回帰の寄与の小さいベスト3のデータフレーム{r:回帰の寄与率, lot, mean.est:サンプルの平均, sd.res:残差標準偏差
+rratio <- function (pcode, ix = 9, specix = ix - 6, plot = T, rm.out = F, verbose = T) 
+{
+  if (plot) {
+    if (!is.null(dev.list())) dev.off()
+    windows()
+    split.screen(c(2, 2))
+  }
+  x <- t[t$pcode == pcode, ]
+  out <- boxplot(x[,ix], plot=F)$out
+  if (rm.out) x <- ss(x, !(x[,ix] %in% out))
+  x <- x[order(x$day), ]
+  n <- nrow(x)
+  r <- vector()
+  sd.res <- vector()
+  mean.est <- vector()
+  rmin <- 1
+  nmin <- 1
+  coefmin <- vector()
+  for (i in 1:(n - 1)) {
+    aov <- aov(x[i:n,ix] ~ x$day[i:n])
+    coef <- coef(aov)
+    mean.est <- c(mean.est, coef[2] * as.integer(x$day[n]) + 
+                    coef[1])
+    s <- summary(aov)[[1]]
+    ss <- s$"Sum Sq"
+    sd.res <- c(sd.res, sqrt(s$"Mean Sq"[2]))
+    rho <- ss[1]/sum(ss)
+    if (is.nan(rho)) rho = 1 #最新2ロットの粘度が等しい時、rho = 0/0 = NaNになってしまう
+    r <- c(r, rho)
+    if (rho < rmin) {
+      rmin <- rho
+      nmin <- i
+      coefmin <- coef
+    }
+  }
+  d <- data.frame(r, x$lot[1:(n - 1)], mean.est, sd.res)
+  names(d)[2] <- "lot"
+  nspan <- round(n/5)
+  ma <- filter(x[,ix], rep(1/nspan, nspan), sides = 1)
+  ma <- t(t(ma))
+  pc <- pcode
+  specv <- ss(spec, pcode == pc)
+  if (verbose) {
+    print(out)
+    print(d[order(d$r), ][1:3, ]) #回帰の寄与の小さいベスト3
+    print(d[c(1, order(d$r)[1] + 1), ]) #全ロットによる結果と、回帰最小のロットの一つ後のロット
+    print(specv)
+  }
+  #1週間粘度規格が無い場合、1日粘度規格を用いる
+  if (is.na(specv[,6])) specv[,6]<-specv[,4]
+  if (is.na(specv[,7])) specv[,7]<-specv[,5]
+  if (plot) {                                                     
+    screen(2)
+    par(mar = c(2, 2, 3, 0))
+    plot(x$day[1:(n - 1)], r, ty = "l", main = "回帰の寄与率(ρ)")
+    abline(v = x$day[nmin])
+    screen(4)
+    par(mar = c(2, 2, 3, 0))
+    plot(x$day[1:(n - 1)], sd.res, ty = "l", main = "残差標準偏差(σ)")
+    abline(v = x$day[nmin])
+    screen(3)
+    par(mar = c(2, 2, 3, 0))
+    plot(x$day[1:n], ma[1:n], ty = "l", ylim = c(min(x[,ix], na.rm = T), 
+                                                 max(x[,ix], na.rm = T)), main = "移動平均")
+    abline(v = x$day[nmin])
+    screen(1)
+    par(mar = c(2, 2, 3, 0))
+    plot(x$day, x[,ix], main = "粘度")
+    abline(h = mean.est[nmin], lwd = 2)
+    abline(h = mean.est[nmin] + sd.res[nmin] * 2)
+    abline(h = mean.est[nmin] - sd.res[nmin] * 2)
+    abline(v = x$day[nmin])
+    #	abline(h = specv[1,specix], col="red")
+    #	abline(h = specv[1,specix+1], col="red")
+  }
+  d[order(d$r), ][1:3, ]
+}
+#工程能力指数を計算する
+#データ区間はrratioの戻り値によって制限する
+#オプションlimで計算に使用するデータ区間を指定する
+#デフォルトで1日粘度の解析。1週間はix=11とする
+#オプションrm.outでboxplotの外れ値を除去した解析を指定する
+#戻り値:
+pci <- function (pcode, ix = 9, rm.out = F, lim = NULL, verbose = T) {
+  x <- t[t$pcode == pcode, ]
+  x <- x[order(x$day), ]
+  d <- rratio(pcode, ix = ix, rm.out = rm.out, plot = F, verbose = verbose)
+  pcode_ <- pcode
+  specv <- ss(spec, spec$pcode == pcode_)
+  sd.new <- d$sd.res[1]
+  if (is.null(lim)) lim <- as.integer(row.names(d[1,]))
+  #print(x[-1:-(lim-1),])
+  sd.old <- sd(x[-1:-(lim-1),ix], na.rm = T)
+  w <- ifelse(ix == 9, specv$dt - specv$db, specv$wt - specv$wb)
+  cp.old <- w / (6 * sd.old)
+  #旧規格と同じ工程能力指数となる新規格幅を計算する
+  w.new <- w * (sd.new / sd.old)
+  #cp.oldと新規格値を返す
+  res <- c(pcode, cp.old, d$mean.est[1]-w.new/2, d$mean.est[1]+w.new/2)
+  if (verbose) print(res)
+  res
+}
+
+#安定度指数を計算する
+si <- function (pcode, ix = 9, rm.out = F, lim = NULL, verbose =T) {
+  x <- t[t$pcode == pcode, ]
+  x <- x[order(x$day), ]
+  d <- rratio(pcode, ix = ix, rm.out = rm.out, plot = F, verbose = verbose)
+  if (is.null(lim)) lim <- as.integer(row.names(d[1,]))
+  x <- x[-1:-(lim-1),]
+  #変動係数の計算
+  cv.d0 <- sd(x$d0h, na.rm=T) / mean(x$d0h, na.rm=T)
+  cv.d <- sd(x$dh, na.rm=T) / mean(x$dh, na.rm=T)
+  cv.w <- sd(x$wh, na.rm=T) / mean(x$wh, na.rm=T)
+  cv.a <- sd(x$ah, na.rm=T) / mean(x$ah, na.rm=T)
+  #安定度指数の計算
+  si.0d <- cv.d / cv.d0
+  si.0w <- cv.w / cv.d0
+  si.dw <- cv.w / cv.d
+  si.da <- cv.a / cv.d
+  res <- c(pcode, si.0d, si.0w, si.dw, si.da)
+  if (verbose) print(res)
+  res
+}
+
+#1日粘度規格から1週間粘度規格を決定する。
+specest.dw <- function(pcode, db, dt) {
+  mean.est <- rratio(pcode, ix = 11, plot = F, verbose = F)$mean.est[1]
+  si.dw <- si(pcode, verbose = F)[4]
+  hw <- (dt - db) * si.dw / 2
+  c(mean.est - hw, mean.est + hw)
+}
+
+rplot<-function(x){
+d<-ss(m,pcode==x,c(d0h,dh,wh))
+s<-ss(spec,pcode==x)
+matplot(c(0,1,7),t(d),ty='b',col=1)
+abline(h=s$db,col="red")
+abline(h=s$dt,col="red")
+abline(h=s$wb)
+abline(h=s$wt)
+print(paste(s$pcode, s$series, s$cc))
+}
+eplot<-function(s){apply(s,1,function(x){print(x);rplot(x);readline()})}
+eplot(ss(s,pcode > 530010))
+
+#0dと1dでの粘度の動きを確認する。増粘するものと減粘するものの比率を調べる
+d.d0<-(cbind(ss(m,T,c(pcode,lot,d0h,dh)), dif=m$dh-m$d0h))
+plus<-tapply(d.d0$dif,d.d0$pcode,function(x){length(x[x>=0])})
+minus<-tapply(d.d0$dif,d.d0$pcode,function(x){length(x[x<0])})
+pm<-(cbind(plus,minus))
+pm<-data.frame(pm)
+pm<-(cbind(pm,with(pm, ratio=ifelse(plus>minus, minus/plus, plus/minus))))
+
+hist(ss(pm,(pcode >= 545009) & (pcode <= 547155))[[4]], main="HAC", xlab="増減比率") #for HAC
+hist(ss(pm,(pcode >= 530011) & (pcode <= 531660))[[4]], main="HWC", xlab="増減比率") #for HWC
+hist(ss(pm,(pcode >= 535006) & (pcode <= 536659))[[4]], main="HGC", xlab="増減比率") #for HGC
+hist(ss(pm,(pcode >= 548002) & (pcode <= 549515))[[4]], main="HAG", xlab="増減比率") #for HAG
+
+#各粘度データの平均と標準偏差をまとめる
+vsum<-(tapply(m$d0h, m$pcode, length))
+vsum<-cbind(vsum, d0m=(tapply(m$d0h, m$pcode, mean, na.rm=T)))
+vsum<-cbind(vsum, dm=(tapply(m$dh, m$pcode, mean, na.rm=T)))
+vsum<-cbind(vsum, wm=(tapply(m$wh, m$pcode, mean, na.rm=T)))
+vsum<-cbind(vsum, d0s=(tapply(m$d0h, m$pcode, sd, na.rm=T)))
+vsum<-cbind(vsum, ds=(tapply(m$dh, m$pcode, sd, na.rm=T)))
+vsum<-cbind(vsum, ws=(tapply(m$wh, m$pcode, sd, na.rm=T)))
+vsum<-data.frame(vsum)
+names(vsum)[1]<-"n"
+
+tmp<-ss(vsum,(pcode >= 530011) & (pcode <= 531660))
+hist(tmp$wm-tmp$dm, main="HWC", xlab="平均の差")
+hist(tmp$ws/tmp$ds, main="HWC", xlab="標準偏差の比")
+tmp<-ss(vsum,(pcode >= 535006) & (pcode <= 536659))
+hist(tmp$wm-tmp$dm, main="HGC", xlab="平均の差")
+hist(tmp$ws/tmp$ds, main="HGC", xlab="標準偏差の比")
+tmp<-ss(vsum,(pcode >= 545009) & (pcode <= 547155))
+hist(tmp$wm-tmp$dm, main="HAC", xlab="平均の差")
+hist(tmp$ws/tmp$ds, main="HAC", xlab="標準偏差の比")
+tmp<-ss(vsum,(pcode >= 548002) & (pcode <= 549515))
+hist(tmp$wm-tmp$dm, main="HAG", xlab="平均の差")
+hist(tmp$ws/tmp$ds, main="HAG", xlab="標準偏差の比")
+
+#vsumを使い、一日粘度規格から相応の一週間粘度規格を求める
+stdcnv<-function(p, b, t) {
+r<-ss(vsum, pcode == p)
+d<-r$wm-r$dm #平均の差
+pr<-r$ws/r$ds #標準偏差の比
+range<-(t-b)*pr/2
+center<-(t+b)/2+d
+c(center-range, center+range)
+}
+
+#vsumを使い、一週間粘度規格から相応の一日粘度規格を求める
+stdcnv.wd<-function(p, b, t) {
+r<-ss(vsum, pcode == p)
+d<-r$dm-r$wm #平均の差
+pr<-r$ds/r$ws #標準偏差の比
+range<-(t-b)*pr/2
+center<-(t+b)/2+d
+c(center-range, center+range)
+}
+
+#vsumを使い、一週間粘度規格から相応の製造時粘度規格を求める
+stdcnv.w0<-function(p, b, t) {
+r<-ss(vsum, pcode == p)
+d<-r$d0m-r$wm #平均の差
+pr<-r$d0s/r$ws #標準偏差の比
+range<-(t-b)*pr/2
+center<-(t+b)/2+d
+c(center-range, center+range)
+}
+
+
+ 
+#ニューラルネットによる一週間粘度の推定
+p<-530110
+nest<-function(p, slots=0, v=NULL) { #slots: 推定値の最小個数。推定値が広範囲に広がる方が良いので、最低限必要な個数を指定する
+rplot(p)
+if (is.null(v)) v<-ss(m, pcode==p & !is.na(d0h) & !is.na(wh),c(d0h,dh,wh))
+n<-ifelse(nrow(v) > 10, 10, nrow(v))
+#n<-20
+dmax<-100
+ne<-100
+for(i in 1:1000) {
+#dhとd0hの差をdh,d0hの2倍程度の大きさにスケーリングする
+dd.factor<<-(mean(v$dh)+mean(v$d0h))/mean(v$dh-v$d0h)
+dd<<-(v$dh-v$d0h)*dd.factor
+
+nnt<-nnet(cbind(v[,1:2],dd),class.ind(cut(v[,3],n)),size=2,decay=5e-4,maxit=1000, rang=1/max(v[,3]), trace=F)
+et<-apply(predict(nnt, cbind(v[,1:2],dd)), 1, which.is.max) * (max(v[,3]) - min(v[,3])) / n + min(v[,3])
+
+net<-length(unique(et))
+maxet<-max(abs(et-v[,3]))
+if ((maxet < dmax) || ((maxet <= dmax) && (net > ne))) {
+if (net >= slots) {nn<<-nnt; e<-et; ne<-net; dmax<-maxet}
+print(paste(dmax, ne, "at", i, "iteration"))}
+}
+matplot(c(0,1,7,8), t(cbind(v, e)), ty='b',col=1)
+less(cbind(v, e))
+print((max(v[,3]) - min(v[,3])) / n)
+print(fivenum(abs(e-v[,3])))
+print(sd(e-v[,3]))
+}
+
+530011について、半分のサンプルから残りの粘度を予測した。学習データ自体を予測させた時のずれは最大18、標準偏差は7.81。残りの予測した時のずれは最大25、標準偏差11.1
+
+530011 15.6	7.62	4	18.6	7.3	6
+530020 16	7.76		17	6.73	4
+530097 5.2	2.04		5.2	2.04	3
+530100 10	3.26		3	4.58	6
+530110 2.6	1.01		2.6	1.06	5
+530118 10.6	2.96		8.6	4.64	5
+530126 10.5	4.88		10.5	4.14	7
+530134 14.2	4.52	5	14.2	4.96	5
+530142 13.8	4.68	5
+530150 16	6.99	7
+530169 17.2	8.2	6
+530177 2.29	6.88	7
+530185 12.2	5.55	5
+530193 16.5	6.88	5
+530206 7.6	3.29	7
+530214 4.69	12.8	6
+530222 1.34	3.56	6
+530224 9	5.12	4
+530224 12	3.87	8
+530310	7	3.27	6
+530329 15	5.72	8
+
+
+#以下は旧バージョン
+
+#以下列の並びがday, pcode, v(粘度値)となったデータを処理する
+#粘度値がNAのデータを削除する
+t[!is.na(t[3]),]->t
+
+#データ数が3未満の製品を削除する
+table(t$pcode)->count
+t[t$pcode %in% unlist(dimnames(count[count>2])),]->t
+rm(count)
+
+#各色毎に分散分析を実行する。
+by(t, t$pcode, function(x){ aov(x[[3]] ~ x$day, data=x)})->aov
+sapply(aov, summary)->summary
+
+#coefficientsの取り出し。
+lapply(aov, coef)->coef
+
+#SKIP!! F検定の確率の取り出し。データ数が2以下の色では確率が格納されず、prに含まれないことに注意
+#lapply(summary, function(x){x$'Pr(>F)'})->pr
+#unlist(lapply(pr, function(x){x[1]}))->pr
+
+#回帰の残差分散の取り出し。この値が回帰を差し引いた後の粘度の標準偏差になる
+sapply(summary, function(x){sqrt(x$'Mean Sq'[2])})->sd.res
+
+#obsolete 現時点(2010年6月)での回帰による粘度の推定値
+#unlist(lapply(coef, function(x){x[2]*20104170 + x[1]}))->mean.est
+tapply(t$day, t$pcode, max)->maxDay
+mapply(function(c, d){c[2]*d + c[1]}, coef, maxDay)->mean.est
+names(mean.est)<-names(coef)
+
+#元データから平均と標準偏差を求める
+tapply(t[[3]], t$pcode, mean)->mean
+tapply(t[[3]], t$pcode, sd)->sd
+
+#全てをまとめる
+data.frame(mean, sd, mean.est, sd.res)->v
+names(v)<-c('mean', 'sd', 'mean.est', 'sd.res')
+
+#標準偏差と回帰残差の比較列を追加
+#cbind(v, v$sd > v$sd.res)->v
+#names(v)[5]<-'>res'
+
+#標準偏差と回帰残差の比を追加
+cbind(v, v$sd.res / v$sd)->v
+names(v)[5]<-'sd.res/sd'
+
+v<-cbind(row.names(v),v)
+names(v)[1]<-'pcode'
+
+#粘度規格値の読み込み→QCの粘度規格表を使うように変更
+#(製造コード、下限、上限)の形式のデータを用意し、名前をspecにする
+read.table('~/aqVisSpec', sep='\t')->spec.org
+names(spec.org)<-c('pcode', 'series', 'name', 'dl', 'dh', 'wl', 'wh', 'al', 'ah')
+spec.org[!is.na(spec.org$pcode),]->spec.org
+spec.org[order(spec.org$pcode),]->spec.org
+spec.org[,c(1,4,5)]->spec
+names(spec)[2:3]<-c('l', 'h')
+
+#specとvの結合
+tmp<-merge(v, spec)
+
+#実績値データが規格値範囲に入る確率
+cbind(tmp, pnorm(tmp$h, mean=tmp$mean, sd=tmp$sd) -  pnorm(tmp$l, mean=tmp$mean, sd=tmp$sd))->tmp 
+
+#回帰推定値データが規格値範囲に入る確率
+cbind(tmp, pnorm(tmp$h, mean=tmp$mean_est, sd=tmp$sd_res) -  pnorm(tmp$l, mean=tmp$mean_est, sd=tmp$sd_res))->tmp 
+
+names(tmp)[10:11]<-c('q.rate', 'q.rate.reg')
+
+#元と回帰の分散の比較に従って採用する値を選択し、一本にまとめる
+cbind(tmp[,c(1:3)],
+ifelse(tmp$'>res', tmp$mean_est, tmp$mean),
+ifelse(tmp$'>res', tmp$sd_res, tmp$sd),
+ifelse(tmp$'>res', tmp$q.rate.reg, tmp$q.rate))->tmp.red
+names(tmp.red)[4:6]<-c('mean', 'sd', 'q.rate')
+
+
+
+
+#元データのプロットファンクション
+porg <- function(x, title='') {
+	plot(t[t$pcode==x,1], t[t$pcode==x,7], main=title, xlab='year', ylab='100rpm,1w')
+	abline(coef[,as.character(x)])
+}
+
+
+
+#2つの値範囲の重なりを返す関数
+overlap <- function(x, y) {
+if (x[1] > y[1]) { #xは常にyより下
+	t<-x
+	x<-y
+	y<-t
+}
+if (x[2] < y[1]) return(0)
+intersection <- ifelse(y[2] < x[2], y[2]-y[1], x[2]-y[1])
+union <- ifelse(y[2] < x[2], x[2]-x[1], y[2]-x[1])
+intersection / union
+}
+
+#現行規格値と新規格値の重なり度合いの計算
+ apply(tmp[,4:7], 1, function(x){overlap(c(x[1],x[2]),c(x[3],x[4]))})
+
+#rratioの旧バージョン
+rratio <- function(x) { #regression ratio
+x<-x[order(x$day),]
+dev.set(4)
+plot(x$day, x$dh)
+r<-vector()
+sd.res<-vector()
+rmin<-1
+nmin<-1
+coefmin<-vector()
+for (i in 1:(nrow(x)-1)) {
+aov<-aov(x$dh[i:nrow(x)] ~ x$day[i:nrow(x)])
+coef<-coef(aov)
+s<-summary(aov)[[1]]
+ss<-s$'Sum Sq'
+sd.res<-c(sd.res, sqrt(s$'Mean Sq'[2]))
+rho<-ss[1]/sum(ss)
+r<-c(r,rho)
+if (rho < rmin) {
+	rmin<-rho
+	nmin<-i
+	coefmin<-coef
+}
+cat(i, ss[1]/sum(ss), '\n')
+}
+mean.est<-coefmin[2]*as.integer(x$day[nrow(x)])+coefmin[1]
+cat('min=', nmin, mean.est, sd.res[nmin], '\n')
+dev.set(5)
+plot(x$day[1:(nrow(x)-1)], r, ty='l')
+abline(v=x$day[nmin])
+dev.set(6)
+plot(x$day[1:(nrow(x)-1)], sd.res, ty='l')
+abline(v=x$day[nmin])
+dev.set(4)
+abline(h=mean.est, lwd=2)
+abline(h=mean.est+sd.res[nmin]*2)
+abline(h=mean.est-sd.res[nmin]*2)
+abline(v=x$day[nmin])
+}
+
+
+#以下はobsolete
+#粘度データのサニティチェック。最小値と最大値の、平均値との比を求める
+#[pcode, lot, vis]の形のデータを使用する
+#出力は最小値と最大値の平均値との比、及び最小値と最大値そのもの
+sanity<-function(x){
+	fns<-tapply(x[,3], x[,1], fivenum)
+	t(sapply(fns, function(x){c(x[1]/x[3], x[5]/x[3], x[1], x[5])}))
+}
+
+#2.データの取得はこんな感じ。select文の3つ目の列で欲しい粘度値を指定する
+v<-sqlQuery(ch, "select seizou_code, lot_no, day_100 from 粘度データ")
+s<-sanity(v)
+less(s[order(-s[,2]),]) #最大値のチェック
+less(s[order(s[,1]),]) #最小値のチェック
+
+#3.現場粘度のチェック
+ch<-odbcConnect("wakui")
+#上と同様、クエリーの3つ目のパラメータをd0l, d0h, d1l, d1hと動かす
+v<-sqlQuery(ch, "select pcode, lot, d0h from hiravis")
+s<-sanity(v)
+less(s[order(-s[,2]),]) #最大値のチェック
+less(s[order(s[,1]),]) #最小値のチェック
+
+#回帰の寄与をデータ点の個数を減らしながら調べる。粘度値としてdhを使用するよう決め打ちしていることに注意
+function (pcode, plot = T) 
+{
+    if (plot) {
+        dev.off()
+        windows()
+        split.screen(c(2, 2))
+    }
+    x <- t[t$pcode == pcode, ]
+    x <- x[order(x$day), ]
+    n <- nrow(x)
+    r <- vector()
+    sd.res <- vector()
+    mean.est <- vector()
+    rmin <- 1
+    nmin <- 1
+    coefmin <- vector()
+    for (i in 1:(n - 1)) {
+        aov <- aov(x$dh[i:n] ~ x$day[i:n])
+        coef <- coef(aov)
+        mean.est <- c(mean.est, coef[2] * as.integer(x$day[n]) + 
+            coef[1])
+        s <- summary(aov)[[1]]
+        ss <- s$"Sum Sq"
+        sd.res <- c(sd.res, sqrt(s$"Mean Sq"[2]))
+        rho <- ss[1]/sum(ss)
+        r <- c(r, rho)
+        if (rho < rmin) {
+            rmin <- rho
+            nmin <- i
+            coefmin <- coef
+        }
+    }
+    d <- data.frame(r, x$lot[1:(n - 1)], mean.est, sd.res)
+    names(d)[2] <- "lot"
+    print(d[order(d$r), ][1:3, ])
+    print(d[c(1, order(d$r)[1] + 1), ])
+    nspan <- round(n/5)
+    ma <- filter(x$dh, rep(1/nspan, nspan), sides = 1)
+    ma <- t(t(ma))
+    cat(ma)
+    if (plot) {
+        screen(2)
+        par(mar = c(2, 2, 3, 0))
+        plot(x$day[1:(n - 1)], r, ty = "l", main = "回帰の寄与率(ρ)")
+        abline(v = x$day[nmin])
+        screen(4)
+        par(mar = c(2, 2, 3, 0))
+        plot(x$day[1:(n - 1)], sd.res, ty = "l", main = "残差標準偏差(σ)")
+        abline(v = x$day[nmin])
+        screen(3)
+        par(mar = c(2, 2, 3, 0))
+        plot(x$day[1:n], ma, ty = "l", ylim = c(min(x$dh, na.rm = T), 
+            max(x$dh, na.rm = T)), main = "移動平均")
+        abline(v = x$day[nmin])
+        screen(1)
+        par(mar = c(2, 2, 3, 0))
+        plot(x$day, x$dh, main = "一日粘度")
+        abline(h = mean.est[nmin], lwd = 2)
+        abline(h = mean.est[nmin] + sd.res[nmin] * 2)
+        abline(h = mean.est[nmin] - sd.res[nmin] * 2)
+        abline(v = x$day[nmin])
+    }
+}
+

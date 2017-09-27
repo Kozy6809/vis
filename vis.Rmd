@@ -1,0 +1,47 @@
+---
+title: "水系粘度解析"
+output: html_notebook
+---
+
+Rによる粘度データの解析
+
+○解析の手順
+品質管理dbの"粘度データ"テーブルからデータ取得
+```{r}
+getVisData()
+names(t)<-c("day", "pcode", "lot", "dl", "dh", "wl", "wh", "al", "ah")
+hiravisiv<-sqlQuery(ch, "select * from hiravisiv")
+names(hiravisiv)[6]<-"day"
+t<-merge(hiravisiv, t, all.y=T)
+
+```
+
+1.まずDBのサニティチェックを実施し、おかしな粘度値は修正しておく
+
+boxplotを使ったサニティチェック。外れ値を抽出している。チェックしたい列ごとに書き換えて実行する
+```{r}
+san<-tapply(t$ah, t$pcode, FUN=function(x){out <- boxplot(x, plot=F)$out; out/mean(x, na.rm=T)})
+cpy(unlist(san))
+```
+そのままでは修正すべきtypoや換算ミスが外れ値に埋もれて見えてこないので、平均で割っている。結果をExcelでソートして確認する
+
+粘度規格は同じ製造コードで2件(HAC, HAU)入っているものがあるので注意が必要
+粘度規格表をそのままコピペしてから、重複行を除去する。だが日本語を含むデータをRStudioで
+pstしようとするとエラーになることがあった。その場合pstは裸のRで行わなければならない。
+```{r}
+spec <- pst()
+spec<-unique(spec[,-2:-3])
+names(spec) <- c("pcode","db","dt","wb","wt","ab","at")
+```
+
+全データにpci()を適用する。最低3ロット必要
+```{r}
+tgt <- as.numeric(unlist(dimnames(table(t$pcode)[table(t$pcode)>4])))
+pcires <- sapply(tgt, pci, verbose=F)
+```
+
+#変更点
+#日付を数値型から日付型に変更する
+#予測を現在時点でなく、データの最新時点で実施する
+
+
