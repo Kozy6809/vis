@@ -8,7 +8,9 @@ Rによる粘度データの解析
 ○解析の手順
 品質管理dbの"粘度データ"テーブルからデータ取得
 ```{r}
-getVisData()
+library("RODBC")
+ch<-odbcConnect("qc")
+t <- getVisData()
 names(t)<-c("day", "pcode", "lot", "dl", "dh", "wl", "wh", "al", "ah")
 hiravisiv<-sqlQuery(ch, "select * from hiravisiv")
 names(hiravisiv)[6]<-"day"
@@ -34,10 +36,58 @@ spec<-unique(spec[,-2:-3])
 names(spec) <- c("pcode","db","dt","wb","wt","ab","at")
 ```
 
-全データにpci()を適用する。最低3ロット必要
+全データにpci()を適用する。最低3ロット必要。ものによって異常な結果になるので、ここでは4ロット以上としている。dh==NAのデータがあるので、それを削除してから処理する。
 ```{r}
-tgt <- as.numeric(unlist(dimnames(table(t$pcode)[table(t$pcode)>4])))
+t.org <- t
+t <- ss(t, !is.na(dh),)
+tgt <- as.numeric(unlist(dimnames(table(t$pcode)[table(t$pcode)>3])))
 pcires <- sapply(tgt, pci, verbose=F)
+dfpcires <- data.frame(t(pcires))
+names(dfpcires) <- c("pcode","pci","new.db","new.dt")
+t <- t.org
+```
+現行規格がNAの場合はpciもNAになる。また規格が0-0になっているものがあり、その場合pciも0になる。
+
+工程能力指数の度数分布
+```{r}
+hist(dfpcires$pci, br=500, xlim=c(0,5), main="", xlab="工程能力指数")
+```
+
+
+```{r}
+nospec <- merge(spec, dfpcires)
+```
+
+粘測を省くために、チクソの変動を評価する
+```{r}
+ti <- within(t, {td <- dl/dh; tw <- wl/wh; ta <- al/ah; tdw <- tw/td; tda <- ta/td})
+tihwc <- ss(merge(pcode, ti), series=="HWC", c(pcode, series, name, td, tw, ta, tdw, tda))
+sdtdw <- tapply(ti$tdw, ti$pcode, function(x) sd(x, na.rm=T)/mean(x, na.rm=T))
+sdtdwhwc <- tapply(tihwc$tdw, tihwc$pcode, function(x) sd(x, na.rm=T)/mean(x, na.rm=T))
+sdtdahwc <- tapply(tihwc$tda, tihwc$pcode, function(x) sd(x, na.rm=T)/mean(x, na.rm=T))
+tihgc <- ss(merge(pcode, ti), series=="HGC", c(pcode, series, name, td, tw, ta, tdw, tda))
+sdtdwhgc <- tapply(tihgc$tdw, tihgc$pcode, function(x) sd(x, na.rm=T)/mean(x, na.rm=T))
+sdtdahgc <- tapply(tihgc$tda, tihgc$pcode, function(x) sd(x, na.rm=T)/mean(x, na.rm=T))
+```
+
+各変動係数のプロット
+```{r}
+hist(sdtdwhwc, br=100, xlab="HWC 1週間チクソ/1日チクソの変動係数", main="")
+hist(sdtdahwc, br=100, xlab="HWC 促進チクソ/1日チクソの変動係数", main="")
+hist(sdtdwhgc, br=100, xlab="HGC 1週間チクソ/1日チクソの変動係数", main="")
+hist(sdtdahgc, br=100, xlab="HGC 促進チクソ/1日チクソの変動係数", main="")
+```
+
+HWCの1dと1wのチクソ比のばらつきの最大のものについて、チクソ比の信頼区間を求める
+```{r}
+which(sdtdwhwc == max(sdtdwhwc, na.rm=T))
+t.test(ss(ti, pcode==530388, tdw))
+which(sdtdwhgc == max(sdtdwhgc, na.rm=T))
+t.test(ss(ti, pcode==535487, tdw))
+which(sdtdahwc == max(sdtdahwc, na.rm=T))
+t.test(ss(ti, pcode==530601, tda))
+which(sdtdahgc == max(sdtdahgc, na.rm=T))
+t.test(ss(ti, pcode==535487, tda))
 ```
 
 #変更点
@@ -45,3 +95,4 @@ pcires <- sapply(tgt, pci, verbose=F)
 #予測を現在時点でなく、データの最新時点で実施する
 
 
+sdtdw[!is.na(sdtdw) & sdtdw > 1]

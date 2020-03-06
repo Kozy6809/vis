@@ -1,0 +1,129 @@
+---
+title: "conerotor"
+author: "涌井孝治"
+date: "2019年10月2日"
+output: html_document
+---
+
+# コーンプレートローターの互換性検証
+## 互換性検証用試料の選定
+###既存絵具の粘度範囲
+```{r setup}
+library("RODBC")
+library(tidyverse)
+ch<-odbcConnect("wakui")
+p <- sqlQuery(ch, "select * from pcode")
+#ペンチングゼリー、クイックベース、HGC/HAUを除去
+t <- sqlQuery(ch, paste("select n.pcode, day, e10d, e1000d",
+                        "from newvis n inner join pcode p",
+                        "on n.pcode = p.pcode where",
+                        "obsolete = 0 and series <> 'YUJ'",
+                        "and n.pcode not in (536051, 536060, 536300, 546206, 554314, 504601, 504602, 504603, 504604, 504605, 504606, 504607, 544002, 559501, 504069)"))
+names(t)<-c("pcode", "day", "e10d", "e1000d")
+s <- t %>% group_by(pcode) %>% summarise(e10 = mean(e10d, na.rm=T), e1000 = mean(e1000d, na.rm=T))
+s %>% inner_join(p) %>% ggplot() + geom_point(aes(x=e10, y=e1000, color=series))
+
+```
+低速と高速には概ね相関がある。最も粘度が高いのはホワイトグループ。ここから低速最大と高速最大の色を選定すると、EOC TW(次点HOC SW)とHOC CeW(次点EOC TW)になる。
+
+低速最小はRapid Medium。次いでHVCが続き、レギュラーの最小はHOC Sv(次点HOC QphY)
+高速最小はHVC IBk。
+
+極端に低粘のRapid Medium以外の製品について、e10dを5段階に分け、各範囲での
+e1000dの最大最小を求める
+###最大値の検索結果
+```{r}
+r <- s %>% filter(pcode != 504010 & pcode != 504200) %>% mutate(bine10 = cut(e10, 5))
+r %>% group_by(bine10) %>% filter(e1000 == max(e1000)) %>% arrange(bine10) %>% 
+  inner_join(p) %>% select(-5)
+```
+###最小値の検索結果
+```{r}
+r %>% group_by(bine10) %>% filter(e1000 <= min(e1000) + 0.5) %>% arrange(bine10) %>% 
+  inner_join(p) %>% select(-5)
+```
+
+
+###検索結果サマリ
+max
+500660	60.6250	2.950000	(35.5,65]	HOC	Polyazo Yellow(H-1)
+8H 57 2.9 OK
+505052	83.6000	4.330000	(65,94.4]	HVC	MINERAL VIOLET(H-2)
+YG 83 4.25 OK
+500451	121.1018	4.632212	(94.4,124]	HOC	PERMANENT ORANGE(H-3)
+5J 115 3.9
+509161	144.6585	5.146463	(124,153]	DUO	TITANIUM WHITE(H-4)
+ZJ1 127 5.46
+524818	182.5769	5.782692	(153,183]	EOC	TITANIUM WHITE
+5J 164 5.25
+
+min
+505071	40.61667	1.248333	(35.5,65]	HVC	IVORY BLACK(H-5)
+7H 51.1 1.46 OK
+500640	69.38333	1.973333	(65,94.4]	HOC	Bismuth Yellow(H-6)
+5J 74 2.11 OK
+501590	98.50000	2.317500	(94.4,124]	HOC	Transparent Gold Oxide
+8H 122 2.0 NG
+500460	112.42898	2.490725	(94.4,124]	HOC	GREENISH YELLOW(H-7)
+6J 99.2 2.7 OK
+501240	127.75000	3.377500	(124,153]	HOC	Co Turquoise Deep
+3W 122 4.02 NG
+501026	124.73750	3.587566	(124,153]	HOC	CO BLUE (HUE)(H-8)
+4J 140 3.23 OK
+504020	153.39076	4.595126	(153,183]	HOC	ZINC WHITE SF
+XJ2 192 5.39
+
+(153,183]
+520630		POP  PERM WHITE EX	6J	221	6.85
+524818		EOC  TITANIUM WHITE	5J	164	5.25
+504214		HOC  PERM WHITE EX	YJ	190	6.81
+504206		HOC  PERM WHITE SF	XJ2	206	6.87
+504062		HOC  SILVER WHITE	XJ4	206	6.38
+
+
+候補としてはSW / HOC TW / PWExだが、e1000はばらつきが大きくどれでも大差ない
+低粘のレンジと異なり、(153,183]ではe1000の差がほとんど無いので、サンプルは1つだけにする。最新ロットの測定値は以下の通り
+
+SW  YJ1 177 6.27
+SW  XJ1	178	6.16
+SW  9J1 182 6.46
+
+TW  XJ1	148	5.61*(H-10w))
+TW  9J 148 6.08
+
+PWSf  XJ1 196 6.26
+PWSf  8J1 199 6.71*(H-9)
+
+PWEx  YJ	190	6.81
+PWEx  XJ1 197 5.72
+
+
+
+## 測定プロファイルの決定
+検討事項
+現行の測定方法との互換性を検証するためには剪断速度10/sと1000/sが必須だが、それ以外の
+速度は必要か?
+
+また各速度の持続時間は何秒にするべきか?→過去の測定データから各色の経過時間-粘度の
+挙動を調査する
+
+低速の持続時間が現行測定方法より長い場合、そこから高速に移行した後の測定値が
+現行測定方法から乖離していないか検証する→cone.logの測定結果では各色とも大きな乖離は
+見られない
+
+低速の測定値の方が重要
+
+cone.log
+測定スキームは10(1/sec)-30sec, 1000(1/sec)-30sec
+測定試料は:
+HOC CL#4J * 3
+HOC SW#2J * 2
+HOC BS#5J * 3
+
+各色の粘度推移傾向と速度切り替え後3秒以降/30秒の粘度比
+CL#4J 低速1.10 高速0.96
+SW#2J 低速1.03 高速1.29
+BS#5J 低速0.91 高速1.12
+
+##RST-CPSによる測定データのインポート
+
